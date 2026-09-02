@@ -100,10 +100,29 @@ last_alert_time = defaultdict(lambda: 0)
 
 # ----------------------------- HELPERS -------------------------------------
 
+def binance_get(url, params=None, timeout=15):
+    """
+    Wrapper around requests.get that respects Binance's rate-limit /
+    IP-ban responses (429 = rate limited, 418 = IP auto-banned). Both
+    include a Retry-After header telling us how long to wait. Raises the
+    original HTTPError for anything else so callers can still handle it.
+    """
+    resp = requests.get(url, params=params, timeout=timeout)
+    if resp.status_code in (418, 429):
+        retry_after = int(resp.headers.get("Retry-After", 60))
+        log.warning(
+            "Binance returned %s (rate limited / IP ban). Waiting %ss before retrying.",
+            resp.status_code, retry_after,
+        )
+        time.sleep(retry_after)
+        resp = requests.get(url, params=params, timeout=timeout)
+    resp.raise_for_status()
+    return resp
+
+
 def get_usdt_symbols():
     """Fetch all actively trading spot USDT pairs."""
-    resp = requests.get(BINANCE_EXCHANGE_INFO_URL, timeout=15)
-    resp.raise_for_status()
+    resp = binance_get(BINANCE_EXCHANGE_INFO_URL, timeout=15)
     data = resp.json()
     symbols = set()
     for s in data["symbols"]:
@@ -118,8 +137,7 @@ def get_usdt_symbols():
 
 def fetch_all_tickers():
     """One call returns 24hr stats for every symbol (used for price only)."""
-    resp = requests.get(BINANCE_TICKER_URL, timeout=20)
-    resp.raise_for_status()
+    resp = binance_get(BINANCE_TICKER_URL, timeout=20)
     return resp.json()
 
 
@@ -130,12 +148,11 @@ def fetch_real_volume_multiplier(symbol: str):
     (None, None, None) if unavailable.
     """
     try:
-        resp = requests.get(
+        resp = binance_get(
             BINANCE_KLINES_URL,
             params={"symbol": symbol, "interval": KLINE_INTERVAL, "limit": KLINE_CANDLES_NEEDED},
             timeout=10,
         )
-        resp.raise_for_status()
         candles = resp.json()
     except requests.RequestException as e:
         log.warning("Kline fetch failed for %s: %s", symbol, e)
@@ -282,10 +299,23 @@ def process_cycle(symbols):
     return alerts, diagnostics
 
 
+bot_status = {"state": "starting", "symbols_monitored": 0, "last_cycle": None, "last_error": None}
+
+
 def run_bot_loop():
-    log.info("Fetching tradable USDT pairs...")
-    symbols = get_usdt_symbols()
-    log.info("Monitoring %d USDT pairs", len(symbols))
+    symbols = None
+    while symbols is None:
+        try:
+            log.info("Fetching tradable USDT pairs...")
+            symbols = get_usdt_symbols()
+            log.info("Monitoring %d USDT pairs", len(symbols))
+            bot_status["symbols_monitored"] = len(symbols)
+        except Exception as e:
+            log.exception("Startup failed, retrying in 10s: %s", e)
+            bot_status["last_error"] = str(e)
+            time.sleep(10)
+
+    bot_status["state"] = "running"
 
     if TG_BOT_TOKEN and TG_CHAT_ID:
         send_telegram_alert(f"✅ Alert bot started, monitoring {len(symbols)} USDT pairs.")
@@ -298,6 +328,7 @@ def run_bot_loop():
         cycle_start = time.time()
         try:
             alerts, diagnostics = process_cycle(symbols)
+            bot_status["last_cycle"] = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
             for a in alerts:
                 log.info("ALERT: %s", a)
                 send_telegram_alert(a)
@@ -315,8 +346,10 @@ def run_bot_loop():
                     log.info("Cycle complete, no alerts (still building history).")
         except requests.RequestException as e:
             log.error("Network/API error this cycle: %s", e)
+            bot_status["last_error"] = str(e)
         except Exception as e:
             log.exception("Unexpected error: %s", e)
+            bot_status["last_error"] = str(e)
 
         elapsed = time.time() - cycle_start
         sleep_for = max(CHECK_INTERVAL_SECONDS - elapsed, 5)
@@ -332,12 +365,12 @@ def run_bot_loop():
 # Render never puts it to sleep.
 
 def create_app():
-    from flask import Flask
+    from flask import Flask, jsonify
     app = Flask(__name__)
 
     @app.route("/")
     def health():
-        return "Stakan-style alert bot is running.", 200
+        return jsonify(bot_status), 200
 
     return app
 

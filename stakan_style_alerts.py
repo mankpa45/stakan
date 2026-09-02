@@ -57,10 +57,16 @@ Adjust the THRESHOLDS section to taste.
 """
 
 import os
+import io
 import time
 import logging
 import requests
 from collections import defaultdict, deque
+from datetime import datetime
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # ----------------------------- CONFIG ------------------------------------
 
@@ -144,8 +150,9 @@ def fetch_all_tickers():
 def fetch_real_volume_multiplier(symbol: str):
     """
     Real volume check using actual candle data (not a rolling-window
-    estimate). Returns (multiplier, last_1h_volume, prev_1h_volume) or
-    (None, None, None) if unavailable.
+    estimate). Returns (multiplier, last_1h_volume, prev_1h_volume, candles)
+    or (None, None, None, None) if unavailable. Candles are returned too so
+    the same fetch can be reused to draw a chart, instead of fetching twice.
     """
     try:
         resp = binance_get(
@@ -156,10 +163,10 @@ def fetch_real_volume_multiplier(symbol: str):
         candles = resp.json()
     except requests.RequestException as e:
         log.warning("Kline fetch failed for %s: %s", symbol, e)
-        return None, None, None
+        return None, None, None, None
 
     if len(candles) < KLINE_CANDLES_NEEDED:
-        return None, None, None
+        return None, None, None, None
 
     volumes = [float(c[5]) for c in candles]
     half = KLINE_CANDLES_NEEDED // 2
@@ -167,9 +174,50 @@ def fetch_real_volume_multiplier(symbol: str):
     last_1h_volume = sum(volumes[half:])
 
     if prev_1h_volume <= 0:
-        return None, last_1h_volume, prev_1h_volume
+        return None, last_1h_volume, prev_1h_volume, candles
 
-    return last_1h_volume / prev_1h_volume, last_1h_volume, prev_1h_volume
+    return last_1h_volume / prev_1h_volume, last_1h_volume, prev_1h_volume, candles
+
+
+def generate_chart_image(symbol: str, candles) -> bytes:
+    """
+    Small price + volume chart (PNG bytes) built from the same kline data
+    already used for the volume check. Green if price rose over the shown
+    window, red if it fell.
+    """
+    times = [datetime.fromtimestamp(c[0] / 1000) for c in candles]
+    closes = [float(c[4]) for c in candles]
+    volumes = [float(c[5]) for c in candles]
+
+    up = closes[-1] >= closes[0]
+    line_color = "#22c55e" if up else "#ef4444"
+    bar_color = "#86efac" if up else "#fca5a5"
+
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(6, 4), dpi=110,
+        gridspec_kw={"height_ratios": [3, 1]}, sharex=True,
+    )
+    fig.patch.set_facecolor("#0f172a")
+    for ax in (ax1, ax2):
+        ax.set_facecolor("#0f172a")
+        ax.tick_params(colors="#94a3b8", labelsize=7)
+        for spine in ax.spines.values():
+            spine.set_color("#334155")
+        ax.grid(alpha=0.15, color="#94a3b8")
+
+    ax1.plot(times, closes, color=line_color, linewidth=1.6)
+    ax1.set_title(symbol, color="#e2e8f0", fontsize=11, fontweight="bold", loc="left")
+
+    ax2.bar(times, volumes, width=0.003, color=bar_color)
+
+    fig.autofmt_xdate(rotation=30)
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
 
 
 def send_telegram_alert(message: str):
@@ -187,6 +235,28 @@ def send_telegram_alert(message: str):
             log.error("Telegram send failed: %s", r.text)
     except requests.RequestException as e:
         log.error("Telegram send error: %s", e)
+
+
+def send_telegram_photo(image_bytes: bytes, caption: str):
+    """Send the alert as a photo with the message as its caption. Falls
+    back to a plain text alert if the image send fails for any reason."""
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        log.warning("Telegram not configured, would have sent: %s", caption)
+        return
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
+    try:
+        r = requests.post(
+            url,
+            data={"chat_id": TG_CHAT_ID, "caption": caption, "parse_mode": "HTML"},
+            files={"photo": ("chart.png", image_bytes, "image/png")},
+            timeout=20,
+        )
+        if not r.ok:
+            log.error("Telegram photo send failed: %s", r.text)
+            send_telegram_alert(caption)
+    except requests.RequestException as e:
+        log.error("Telegram photo send error: %s", e)
+        send_telegram_alert(caption)
 
 
 def can_alert(symbol: str, reason: str) -> bool:
@@ -260,7 +330,7 @@ def process_cycle(symbols):
 
     for c in candidates:
         symbol = c["symbol"]
-        multiplier, last_1h_vol, prev_1h_vol = fetch_real_volume_multiplier(symbol)
+        multiplier, last_1h_vol, prev_1h_vol, candles = fetch_real_volume_multiplier(symbol)
         if multiplier is None:
             continue
 
@@ -273,28 +343,39 @@ def process_cycle(symbols):
             f"volume {multiplier:.1f}x vs prior hour"
         )
 
+        def build_chart():
+            try:
+                return generate_chart_image(symbol, candles)
+            except Exception as e:
+                log.warning("Chart generation failed for %s: %s", symbol, e)
+                return None
+
         if is_reversal and multiplier >= FLIP_VOLUME_MULTIPLIER:
             if c["trend_sign"] > 0 and can_alert(symbol, "flip_sell"):
-                alerts.append(
+                alerts.append((
                     f"🔴 SELL <b>{symbol}</b>: green→red flip after trending up over "
-                    f"{FLIP_LOOKBACK_MINUTES}m (now {c['last_price']:g})\n{range_str}"
-                )
+                    f"{FLIP_LOOKBACK_MINUTES}m (now {c['last_price']:g})\n{range_str}",
+                    build_chart(),
+                ))
             elif c["trend_sign"] < 0 and can_alert(symbol, "flip_buy"):
-                alerts.append(
+                alerts.append((
                     f"🟢 BUY <b>{symbol}</b>: red→green flip after trending down over "
-                    f"{FLIP_LOOKBACK_MINUTES}m (now {c['last_price']:g})\n{range_str}"
-                )
+                    f"{FLIP_LOOKBACK_MINUTES}m (now {c['last_price']:g})\n{range_str}",
+                    build_chart(),
+                ))
         elif is_continuation and multiplier >= CONTINUATION_VOLUME_MULTIPLIER:
             if c["trend_sign"] > 0 and can_alert(symbol, "continue_up"):
-                alerts.append(
+                alerts.append((
                     f"🟩 CONTINUATION UP <b>{symbol}</b>: still rising after "
-                    f"{FLIP_LOOKBACK_MINUTES}m uptrend (now {c['last_price']:g})\n{range_str}"
-                )
+                    f"{FLIP_LOOKBACK_MINUTES}m uptrend (now {c['last_price']:g})\n{range_str}",
+                    build_chart(),
+                ))
             elif c["trend_sign"] < 0 and can_alert(symbol, "continue_down"):
-                alerts.append(
+                alerts.append((
                     f"🟥 CONTINUATION DOWN <b>{symbol}</b>: still falling after "
-                    f"{FLIP_LOOKBACK_MINUTES}m downtrend (now {c['last_price']:g})\n{range_str}"
-                )
+                    f"{FLIP_LOOKBACK_MINUTES}m downtrend (now {c['last_price']:g})\n{range_str}",
+                    build_chart(),
+                ))
 
     return alerts, diagnostics
 
@@ -329,9 +410,12 @@ def run_bot_loop():
         try:
             alerts, diagnostics = process_cycle(symbols)
             bot_status["last_cycle"] = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
-            for a in alerts:
-                log.info("ALERT: %s", a)
-                send_telegram_alert(a)
+            for message, chart_bytes in alerts:
+                log.info("ALERT: %s", message)
+                if chart_bytes:
+                    send_telegram_photo(chart_bytes, message)
+                else:
+                    send_telegram_alert(message)
             if not alerts:
                 if diagnostics:
                     top = sorted(diagnostics, key=lambda d: abs(d[1]), reverse=True)[:3]

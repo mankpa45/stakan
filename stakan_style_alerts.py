@@ -49,6 +49,8 @@ SETUP (local testing)
 4. Set the two environment variables below (or edit the constants directly):
      export TG_BOT_TOKEN="123456:ABC-your-token"
      export TG_CHAT_ID="123456789"
+   For multiple recipients, use TG_CHAT_IDS instead (comma-separated):
+     export TG_CHAT_IDS="123456789,987654321"
 5. Run: python3 stakan_style_alerts.py
    This starts a small web server (health check for hosting platforms)
    plus the bot loop in a background thread.
@@ -71,7 +73,12 @@ import matplotlib.pyplot as plt
 # ----------------------------- CONFIG ------------------------------------
 
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
+# Comma-separated list of chat ids to send alerts to, e.g. "111111,222222,333333".
+# TG_CHAT_ID (singular) still works for a single recipient, for backward compatibility.
+TG_CHAT_IDS = [
+    c.strip() for c in os.environ.get("TG_CHAT_IDS", os.environ.get("TG_CHAT_ID", "")).split(",")
+    if c.strip()
+]
 
 CHECK_INTERVAL_SECONDS = 30               # poll every 30 seconds
 
@@ -221,42 +228,60 @@ def generate_chart_image(symbol: str, candles) -> bytes:
 
 
 def send_telegram_alert(message: str):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+    if not TG_BOT_TOKEN or not TG_CHAT_IDS:
         log.warning("Telegram not configured, would have sent: %s", message)
         return
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    for chat_id in TG_CHAT_IDS:
+        try:
+            r = requests.post(
+                url,
+                json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
+                timeout=10,
+            )
+            if not r.ok:
+                log.error("Telegram send failed for chat %s: %s", chat_id, r.text)
+        except requests.RequestException as e:
+            log.error("Telegram send error for chat %s: %s", chat_id, e)
+
+
+def send_telegram_photo(image_bytes: bytes, caption: str):
+    """Send the alert as a photo with the message as its caption, to every
+    configured recipient. Falls back to a plain text alert for any
+    recipient whose photo send fails."""
+    if not TG_BOT_TOKEN or not TG_CHAT_IDS:
+        log.warning("Telegram not configured, would have sent: %s", caption)
+        return
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
+    for chat_id in TG_CHAT_IDS:
+        try:
+            r = requests.post(
+                url,
+                data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
+                files={"photo": ("chart.png", image_bytes, "image/png")},
+                timeout=20,
+            )
+            if not r.ok:
+                log.error("Telegram photo send failed for chat %s: %s", chat_id, r.text)
+                send_telegram_alert_to(chat_id, caption)
+        except requests.RequestException as e:
+            log.error("Telegram photo send error for chat %s: %s", chat_id, e)
+            send_telegram_alert_to(chat_id, caption)
+
+
+def send_telegram_alert_to(chat_id: str, message: str):
+    """Send a text alert to one specific chat id (used as a fallback)."""
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     try:
         r = requests.post(
             url,
-            json={"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "HTML"},
+            json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
             timeout=10,
         )
         if not r.ok:
-            log.error("Telegram send failed: %s", r.text)
+            log.error("Telegram fallback send failed for chat %s: %s", chat_id, r.text)
     except requests.RequestException as e:
-        log.error("Telegram send error: %s", e)
-
-
-def send_telegram_photo(image_bytes: bytes, caption: str):
-    """Send the alert as a photo with the message as its caption. Falls
-    back to a plain text alert if the image send fails for any reason."""
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        log.warning("Telegram not configured, would have sent: %s", caption)
-        return
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
-    try:
-        r = requests.post(
-            url,
-            data={"chat_id": TG_CHAT_ID, "caption": caption, "parse_mode": "HTML"},
-            files={"photo": ("chart.png", image_bytes, "image/png")},
-            timeout=20,
-        )
-        if not r.ok:
-            log.error("Telegram photo send failed: %s", r.text)
-            send_telegram_alert(caption)
-    except requests.RequestException as e:
-        log.error("Telegram photo send error: %s", e)
-        send_telegram_alert(caption)
+        log.error("Telegram fallback send error for chat %s: %s", chat_id, e)
 
 
 def can_alert(symbol: str, reason: str) -> bool:
@@ -398,11 +423,12 @@ def run_bot_loop():
 
     bot_status["state"] = "running"
 
-    if TG_BOT_TOKEN and TG_CHAT_ID:
+    if TG_BOT_TOKEN and TG_CHAT_IDS:
         send_telegram_alert(f"✅ Alert bot started, monitoring {len(symbols)} USDT pairs.")
+        log.info("Sending alerts to %d recipient(s).", len(TG_CHAT_IDS))
     else:
         log.warning(
-            "TG_BOT_TOKEN / TG_CHAT_ID not set - alerts will only be logged, not sent."
+            "TG_BOT_TOKEN / TG_CHAT_IDS not set - alerts will only be logged, not sent."
         )
 
     while True:

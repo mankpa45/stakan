@@ -188,24 +188,36 @@ def fetch_real_volume_multiplier(symbol: str):
 
 def generate_chart_image(symbol: str, candles) -> bytes:
     """
-    Small price + volume chart (PNG bytes) built from the same kline data
-    already used for the volume check. Green if price rose over the shown
-    window, red if it fell.
+    Price + volume + order-flow-dynamics chart (PNG bytes), all built from
+    the same kline data already used for the volume check. Green if price
+    rose over the shown window, red if it fell.
+
+    The bottom "Dynamics" panel is a real candlestick strip (open/high/low/
+    close) colored and brightened by actual buy-vs-sell volume delta for
+    that candle, not by price change - matching stakan's actual logic:
+    sharp buy or sell IMBALANCE (delta) drives the color/brightness, not
+    the size of the price move itself. Binance kline data includes taker
+    buy volume per candle, so real delta = taker_buy - taker_sell, no
+    extra API calls needed.
     """
     times = [datetime.fromtimestamp(c[0] / 1000) for c in candles]
+    opens = [float(c[1]) for c in candles]
+    highs = [float(c[2]) for c in candles]
+    lows = [float(c[3]) for c in candles]
     closes = [float(c[4]) for c in candles]
     volumes = [float(c[5]) for c in candles]
+    taker_buy_volumes = [float(c[9]) for c in candles]
 
     up = closes[-1] >= closes[0]
     line_color = "#22c55e" if up else "#ef4444"
     bar_color = "#86efac" if up else "#fca5a5"
 
-    fig, (ax1, ax2) = plt.subplots(
-        2, 1, figsize=(6, 4), dpi=110,
-        gridspec_kw={"height_ratios": [3, 1]}, sharex=True,
+    fig, (ax1, ax2, ax3) = plt.subplots(
+        3, 1, figsize=(6, 5), dpi=110,
+        gridspec_kw={"height_ratios": [3, 1, 1.2]}, sharex=True,
     )
     fig.patch.set_facecolor("#0f172a")
-    for ax in (ax1, ax2):
+    for ax in (ax1, ax2, ax3):
         ax.set_facecolor("#0f172a")
         ax.tick_params(colors="#94a3b8", labelsize=7)
         for spine in ax.spines.values():
@@ -216,6 +228,30 @@ def generate_chart_image(symbol: str, candles) -> bytes:
     ax1.set_title(symbol, color="#e2e8f0", fontsize=11, fontweight="bold", loc="left")
 
     ax2.bar(times, volumes, width=0.003, color=bar_color)
+    ax2.set_ylabel("Volume", color="#94a3b8", fontsize=7)
+
+    # candlestick dynamics panel: real OHLC shape (wick + body), but color
+    # and brightness are driven by buy/sell volume DELTA for that candle,
+    # not price change - net buying = green, net selling = red, and the
+    # more one-sided the delta, the brighter it renders.
+    deltas = [
+        (2 * buy_vol - total_vol)  # buy_vol - (total_vol - buy_vol)
+        for buy_vol, total_vol in zip(taker_buy_volumes, volumes)
+    ]
+    max_abs_delta = max((abs(d) for d in deltas), default=0.0)
+
+    MIN_ALPHA = 0.35  # dimmest a near-balanced (low-delta) candle can be
+    MAX_ALPHA = 1.0   # brightest a candle can be (the most one-sided delta shown)
+
+    for t, o, h, l, cl, delta in zip(times, opens, highs, lows, closes, deltas):
+        candle_color = "#22c55e" if delta >= 0 else "#ef4444"
+        if max_abs_delta > 0:
+            alpha = MIN_ALPHA + (MAX_ALPHA - MIN_ALPHA) * (abs(delta) / max_abs_delta)
+        else:
+            alpha = MIN_ALPHA
+        ax3.plot([t, t], [l, h], color=candle_color, linewidth=1, alpha=alpha)
+        ax3.plot([t, t], [o, cl], color=candle_color, linewidth=4, solid_capstyle="butt", alpha=alpha)
+    ax3.set_ylabel("Dynamics", color="#94a3b8", fontsize=7)
 
     fig.autofmt_xdate(rotation=30)
     plt.tight_layout()

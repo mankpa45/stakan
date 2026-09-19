@@ -233,24 +233,31 @@ def generate_chart_image(symbol: str, candles) -> bytes:
     # candlestick dynamics panel: real OHLC shape (wick + body), but color
     # and brightness are driven by buy/sell volume DELTA for that candle,
     # not price change - net buying = green, net selling = red, and the
-    # more one-sided the delta, the brighter it renders.
+    # more one-sided the delta, the more vivid it renders. Brightness is
+    # encoded as an actual dim-to-vivid color blend (not transparency,
+    # which is too subtle to read against a dark background), and a sqrt
+    # curve spreads out mid-strength deltas instead of clustering them
+    # near "dim."
     deltas = [
         (2 * buy_vol - total_vol)  # buy_vol - (total_vol - buy_vol)
         for buy_vol, total_vol in zip(taker_buy_volumes, volumes)
     ]
     max_abs_delta = max((abs(d) for d in deltas), default=0.0)
 
-    MIN_ALPHA = 0.35  # dimmest a near-balanced (low-delta) candle can be
-    MAX_ALPHA = 1.0   # brightest a candle can be (the most one-sided delta shown)
+    DIM_GREEN = (0.10, 0.25, 0.16)    # muted, low-delta green
+    VIVID_GREEN = (0.20, 0.90, 0.50)  # bright, high-delta green
+    DIM_RED = (0.32, 0.12, 0.12)      # muted, low-delta red
+    VIVID_RED = (0.98, 0.30, 0.30)    # bright, high-delta red
+
+    def blend(dim, vivid, t):
+        return tuple(dim[i] + (vivid[i] - dim[i]) * t for i in range(3))
 
     for t, o, h, l, cl, delta in zip(times, opens, highs, lows, closes, deltas):
-        candle_color = "#22c55e" if delta >= 0 else "#ef4444"
-        if max_abs_delta > 0:
-            alpha = MIN_ALPHA + (MAX_ALPHA - MIN_ALPHA) * (abs(delta) / max_abs_delta)
-        else:
-            alpha = MIN_ALPHA
-        ax3.plot([t, t], [l, h], color=candle_color, linewidth=1, alpha=alpha)
-        ax3.plot([t, t], [o, cl], color=candle_color, linewidth=4, solid_capstyle="butt", alpha=alpha)
+        ratio = (abs(delta) / max_abs_delta) if max_abs_delta > 0 else 0.0
+        ratio = ratio ** 0.5  # sqrt curve: spreads mid-range deltas apart for readability
+        candle_color = blend(DIM_GREEN, VIVID_GREEN, ratio) if delta >= 0 else blend(DIM_RED, VIVID_RED, ratio)
+        ax3.plot([t, t], [l, h], color=candle_color, linewidth=1)
+        ax3.plot([t, t], [o, cl], color=candle_color, linewidth=4, solid_capstyle="butt")
     ax3.set_ylabel("Dynamics", color="#94a3b8", fontsize=7)
 
     fig.autofmt_xdate(rotation=30)
